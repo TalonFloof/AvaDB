@@ -9,6 +9,7 @@ typedef struct AvaDB {
     AvaPager pager;
 } AvaDB;
 
+// This header occupies the first page, the first page serves no other purpose at the moment (it may be used for a journal in the future)
 typedef struct AvaDBFileHeader {
     uint8_t magic[8];
     uint16_t version;
