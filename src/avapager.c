@@ -1,3 +1,4 @@
+#include <stdlib.h>
 #include <avadb/avapager.h>
 
 void ava_pager_init(AvaPager* pager, AvaOSInterface** interface, AvaFile** file) {
@@ -8,7 +9,14 @@ void ava_pager_init(AvaPager* pager, AvaOSInterface** interface, AvaFile** file)
     }
     pager->interface = interface;
     pager->file = file;
+    pager->page_nums = calloc(pager->max_page_quota,sizeof(ava_pgid_t));
+    pager->pages = calloc(pager->max_page_quota,pager->page_size);
 }
 
 void ava_pager_deinit(AvaPager* pager) {
+    /* Free the pager's page cache */
+    if (pager->page_nums != NULL)
+        free(pager->page_nums);
+    if (pager->pages != NULL)
+        free(pager->pages);
 }

@@ -34,7 +34,7 @@
 #elif defined(__TINYC__)
     #define PACKED_OUTER(KEYWORD) KEYWORD __attribute__((packed))
 #else
-    #error Your compiler doesn't appear to support packed structs. If you believe this is a mistake, you are free to open an issue or pull request.
+    #error "Your compiler doesn't appear to support packed structs. If you believe this is a mistake, you are free to open an issue or pull request."
 #endif
 
 #define packed_struct PACKED_OUTER(struct)

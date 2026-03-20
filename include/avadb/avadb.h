@@ -15,7 +15,7 @@ typedef struct AvaDBFileHeader {
     uint16_t version;
     uint16_t page_size;
     uint32_t unused1; /* This entry exists for alignment */
-    uint64_t num_pages;
+    uint64_t num_pages; /* Includes header page */
     uint64_t free_page_start;
     uint64_t root_tree_index;
 } AvaDBFileHeader;
