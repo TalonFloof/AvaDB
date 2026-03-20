@@ -20,3 +20,17 @@ void ava_pager_deinit(AvaPager* pager) {
     if (pager->pages != NULL)
         free(pager->pages);
 }
+
+/* TODO: Implement Pager */
+void* ava_pager_read(AvaPager* pager, ava_pgid_t index) {
+    return NULL;
+}
+void ava_pager_mark_dirty(AvaPager* pager, ava_pgid_t index) {
+
+}
+bool ava_pager_allocate(AvaPager* pager, ava_pgid_t* new_index) {
+    return false;
+}
+void ava_pager_sync(AvaPager* pager) {
+
+}

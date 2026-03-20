@@ -1,4 +1,4 @@
-name: AvaDB Test
+name: AvaDB Check
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    name: Build and Test
+    name: Ubuntu AvaDB Build & Test
     runs-on: ubuntu-latest
 
     steps:
