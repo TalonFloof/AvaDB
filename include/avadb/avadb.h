@@ -3,6 +3,10 @@
 #include "avapager.h"
 #include "avainterface.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct AvaDB {
     AvaOSInterface* interface;
     AvaFile* file;
@@ -19,3 +23,7 @@ typedef struct AvaDBFileHeader {
     uint64_t free_page_start;
     uint64_t root_tree_index;
 } AvaDBFileHeader;
+
+#ifdef __cplusplus
+}
+#endif

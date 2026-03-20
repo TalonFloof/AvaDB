@@ -3,6 +3,10 @@
 #include <stdint.h>
 #include "avainterface.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef uint64_t ava_pgid_t;
 
 typedef struct AvaPager {
@@ -20,3 +24,7 @@ void* ava_pager_read(AvaPager* pager, ava_pgid_t index);
 void ava_pager_mark_dirty(AvaPager* pager, ava_pgid_t index);
 bool ava_pager_allocate(AvaPager* pager, ava_pgid_t* new_index);
 void ava_pager_sync(AvaPager* pager);
+
+#ifdef __cplusplus
+}
+#endif

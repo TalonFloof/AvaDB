@@ -2,6 +2,11 @@
 #include <stdint.h>
 #include "packed.h"
 #include "avapager.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /*
  * AvaDB uses B+ Trees to store key-value pairs, each key may be an arbitrary binary of any length, while a value
  * can either be an arbitrary binary, or a subtree allowing for hierarchical relational organization.
@@ -38,6 +43,9 @@ typedef packed_struct AvaTreePageHeader {
             ava_pgid_t next_free;
         } free;
         struct {
+            ava_pgid_t next;
+        } overflow;
+        struct {
             uint16_t num_entries;
             ava_off_t free_end;
             uint32_t unused2; /* Ensures that the next value is properly aligned, may have future use */
@@ -67,14 +75,10 @@ typedef packed_struct AvaTreeLeafCell {
     uint8_t payload[]; /* [Key Bytes] followed by [Value Bytes or OverflowPgID] */
 } AvaTreeLeafCell;
 
-/* An overflow page contains a pointer to the next page in the chain,
- * and the rest of the page is dedicated to a chunk of the value's data.
- */
-typedef packed_struct AvaTreeOverflowPage {
-    ava_pgid_t next_overflow_page;
-    uint8_t data[];
-} AvaTreeOverflowPage;
-
 ava_pgid_t ava_tree_insert(AvaPager* pager, ava_pgid_t root, char* key, uint8_t key_size, char* value, uint32_t value_size, uint8_t value_type);
 ava_pgid_t ava_tree_delete(AvaPager* pager, ava_pgid_t root, char* key, uint8_t key_size);
 AvaTreeLeafCell* ava_tree_search(AvaPager* pager, ava_pgid_t root, char* key, uint8_t key_size);
+
+#ifdef __cplusplus
+}
+#endif

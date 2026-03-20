@@ -1,6 +1,10 @@
 #pragma once
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef void* AvaFile;
 
 typedef struct AvaOSInterface {
@@ -15,3 +19,7 @@ typedef struct AvaOSInterface {
     int (*lock)(struct AvaOSInterface*, AvaFile*);
     int (*unlock)(struct AvaOSInterface*, AvaFile*);
 } AvaOSInterface;
+
+#ifdef __cplusplus
+}
+#endif

@@ -1,28 +1,28 @@
 #include <gtest/gtest.h>
 #include <vector>
-#include <map>
 #include <cstring>
 #include <string>
 #include <random>
 #include <iostream>
 
-/* 
- * Link C headers with C++ Test Suite 
- */
-extern "C" {
-    #include <avadb/avatree.h>
-    #include <avadb/avapager.h>
-}
+#include <avadb/avatree.h>
+#include <avadb/avapager.h>
 
 // This exists to create a mockup pager that lies in-memory rather than needing an externally backed source
 struct MockStorage {
-    std::vector<std::vector<uint8_t>> pages;
+    // Use pointers to ensure the address of a page never changes even if the vector resizes.
+    std::vector<uint8_t*> pages;
     size_t page_size = 4096;
 
     void reset() {
+        for (auto p : pages) delete[] p;
         pages.clear();
-        // Page 0 is reserved/null
-        pages.push_back(std::vector<uint8_t>(page_size, 0));
+        // Page 0 is reserved for the header
+        pages.push_back(new uint8_t[page_size]());
+    }
+
+    ~MockStorage() {
+        for (auto p : pages) delete[] p;
     }
 };
 
@@ -32,16 +32,16 @@ static MockStorage global_mock;
 extern "C" {
     void* ava_pager_read(AvaPager* pager, ava_pgid_t index) {
         if (index >= global_mock.pages.size()) return nullptr;
-        return global_mock.pages[index].data();
+        return global_mock.pages[index];
     }
 
     void ava_pager_mark_dirty(AvaPager* pager, ava_pgid_t index) {
-        // In memory, changes are instant, no-op needed
+        // Stub since this is in-memory
     }
 
     bool ava_pager_allocate(AvaPager* pager, ava_pgid_t* new_index) {
         ava_pgid_t id = global_mock.pages.size();
-        global_mock.pages.push_back(std::vector<uint8_t>(global_mock.page_size, 0));
+        global_mock.pages.push_back(new uint8_t[global_mock.page_size]());
         *new_index = id;
         return true;
     }
@@ -66,7 +66,7 @@ protected:
     }
 
     /* 
-     * Helper to verify tree structure integrity 
+     * VERY BASIC Helper to verify tree structure integrity
      * Returns true if healthy, false if corrupted.
      */
     void VerifyTree(ava_pgid_t page_id, bool is_root = false) {
@@ -83,12 +83,6 @@ protected:
             
         ASSERT_LE(page->header.node.num_entries, 1000) << "Page " << page_id << " has suspicious entry count";
         ASSERT_LE(page->header.node.free_end, pager.page_size) << "Page " << page_id << " free_end out of bounds";
-
-        if (page->type == AVA_PAGE_TYPE_INTERNAL) {
-            // Recursively verify children
-            // Note: We can't easily iterate children here without copying C logic logic or making helpers public.
-            // For now, checking the page metadata is a good start.
-        }
     }
     
     void DumpSeed(unsigned int seed) {
@@ -214,4 +208,70 @@ TEST_F(AvaTreeTest, FuzzRandomOps) {
             VerifyTree(root, true);
         }
     }
+}
+
+/* This test inserts an entry whose data exceeds the maximum size that is allowed within a single page,
+ * forcing it to overflow to separate pages. We then read and verify the overflow data was written correctly.
+ */
+TEST_F(AvaTreeTest, InsertOverflowTest) {
+    ava_pgid_t root = 0;
+    std::string key = "key";
+
+    size_t large_size = 1024 * 10;
+    std::vector<char> large_data(large_size);
+    for (size_t i=0; i < large_size; i++)
+        large_data[i] = static_cast<char>(i % 256);
+    root = ava_tree_insert(&pager, root, (char*)key.c_str(), key.size(), large_data.data(), large_size, AVA_VALUE_TYPE_BLOB);
+
+    // Search for the key
+    AvaTreeLeafCell* res = ava_tree_search(&pager, root, (char*)key.c_str(), key.size());
+    ASSERT_NE(res, nullptr) << "Couldn't retrieve key!";
+    EXPECT_TRUE(res->value_type & AVA_VALUE_FLAG_OVERFLOW) << "Value wasn't set with overflow flag!";
+    EXPECT_EQ(res->value_size, sizeof(ava_pgid_t)) << "Size didn't match sizeof(ava_pgid_t), got " << res->value_size;
+
+    // Verify that the data was saved correctly
+    ava_pgid_t page_id = *(ava_pgid_t*)(res->payload + res->key_size);
+    std::vector<char> read_back;
+
+    while (page_id != 0) {
+        AvaTreePageHeader* ovf = (AvaTreePageHeader*)ava_pager_read(&pager, page_id);
+        EXPECT_EQ(ovf->type,AVA_PAGE_TYPE_OVERFLOW) << "Page #" << page_id << "was not set as type AVA_PAGE_TYPE_OVERFLOW!";
+        size_t header_sz = sizeof(AvaTreePageHeader);
+        size_t cap = pager.page_size - header_sz;
+        size_t remaining = large_size - read_back.size();
+        size_t chunk = (remaining < cap) ? remaining : cap;
+
+        read_back.insert(read_back.end(), reinterpret_cast<char *>(ovf) + sizeof(AvaTreePageHeader), (reinterpret_cast<char *>(ovf) + sizeof(AvaTreePageHeader))+chunk);
+        page_id = ovf->header.overflow.next;
+    }
+
+    ASSERT_EQ(read_back.size(), large_size) << "Size mismatch, expected " << large_size << " got " << read_back.size();
+
+    if (read_back != large_data) {
+        for (int i=0; i < large_size; i++) {
+            ASSERT_EQ(read_back[i],large_data[i]) << "Data mismatch at " << i << ", expected " << (static_cast<uint16_t>(large_data[i]) & 0xFF) << " got " << (static_cast<uint16_t>(read_back[i]) & 0xFF);
+        }
+    }
+}
+
+/* This tests inserts an overflow entry and then deletes it afterwards.
+ * We verify that the overflow pages that were added were put back onto the free list.
+ */
+TEST_F(AvaTreeTest, DeleteOverflowTest) {
+    ava_pgid_t root = 0;
+    std::string key = "del_overflow";
+    size_t large_size = 6000; // Just enough for 2 pages
+    std::vector<char> large_data(large_size, 'X');
+
+    root = ava_tree_insert(&pager, root, (char*)key.c_str(), key.size(),
+                           large_data.data(), large_size, AVA_VALUE_TYPE_BLOB);
+
+    // Delete
+    root = ava_tree_delete(&pager, root, (char*)key.c_str(), key.size());
+
+    // Verify key is gone
+    AvaTreeLeafCell* res = ava_tree_search(&pager, root, (char*)key.c_str(), key.size());
+    EXPECT_EQ(res, nullptr);
+
+    // TODO: Check Overflow Chain to make sure its actually freed
 }
