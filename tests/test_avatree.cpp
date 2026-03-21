@@ -63,7 +63,9 @@ protected:
         
         p_interface = &mock_interface;
         p_file = (AvaFile*)&mock_file;
-        
+
+        /* Test with a low cache capacity to ensure that we don't have page leaks */
+        pager.cache_capacity = 16;
         ava_pager_init(&pager, &p_interface, &p_file);
     }
 
@@ -256,7 +258,7 @@ TEST_F(AvaTreeTest, InsertOverflowTest) {
 
     while (page_id != 0) {
         AvaTreePageHeader* ovf = (AvaTreePageHeader*)ava_pager_get(&pager, page_id);
-        EXPECT_EQ(ovf->type,AVA_PAGE_TYPE_OVERFLOW) << "Page #" << page_id << "was not set as type AVA_PAGE_TYPE_OVERFLOW!";
+        EXPECT_EQ(ovf->type,AVA_PAGE_TYPE_OVERFLOW) << "Page #" << page_id << " was not set as type AVA_PAGE_TYPE_OVERFLOW!";
         size_t header_sz = sizeof(AvaTreePageHeader);
         size_t cap = pager.page_size - header_sz;
         size_t remaining = large_size - read_back.size();

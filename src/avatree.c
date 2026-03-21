@@ -13,6 +13,7 @@ static ava_pgid_t create_overflow_chain(AvaPager* pager, char* data, uint32_t si
         ava_pgid_t new_page;
         ava_pager_allocate(pager, &new_page);
         AvaTreePageHeader* page = ava_pager_get(pager, new_page);
+        ava_pager_mark_dirty(pager, new_page);
         page->type = AVA_PAGE_TYPE_OVERFLOW;
 
         if (first_page == 0)
@@ -30,7 +31,6 @@ static ava_pgid_t create_overflow_chain(AvaPager* pager, char* data, uint32_t si
         uint32_t to_write = (size-written > pager->page_size - sizeof(AvaTreePageHeader)) ? (pager->page_size - sizeof(AvaTreePageHeader)) : (size-written);
 
         memcpy((uint8_t*)page + sizeof(AvaTreePageHeader), data + written, to_write);
-        ava_pager_mark_dirty(pager, current_page);
         written += to_write;
         ava_pager_unpin(pager, new_page);
     }

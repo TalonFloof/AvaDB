@@ -63,8 +63,6 @@ void ava_pager_deinit(AvaPager* pager) {
 static AvaPagerSlot* find_slot(AvaPager* pager, ava_pgid_t pgid) {
     uint32_t index = hash_pgid(pgid) % pager->hash_map_size;
     /* TODO: Improve worse-case, currently O(n) due to linear probing */
-    if (!pager->hash_map[index])
-        return NULL;
     for (uint32_t i=0; i < pager->hash_map_size; i++) {
         uint32_t cur = (index + i) % pager->hash_map_size;
         if (pager->hash_map[cur] && pager->hash_map[cur]->pgid == pgid) {
@@ -161,10 +159,11 @@ bool ava_pager_allocate(AvaPager* pager, ava_pgid_t* new_pgid) {
             ava_pager_unpin(pager, 0);
             return false;
         }
-        header->free_page_start = page->header.free.next_free;
         ava_pager_mark_dirty(pager,index);
-        page->header.free.next_free = 0;
         ava_pager_mark_dirty(pager,0);
+
+        header->free_page_start = page->header.free.next_free;
+        page->header.free.next_free = 0;
         *new_pgid = index;
         ava_pager_unpin(pager, index);
         ava_pager_unpin(pager, 0);
