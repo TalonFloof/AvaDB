@@ -8,7 +8,7 @@ extern "C" {
 #endif
 
 /*
- * AvaDB uses B+ Trees to store key-value pairs, each key may be an arbitrary binary of any length, while a value
+ * AvaDB uses B+ Trees to store key-value pairs, each key may be an arbitrary binary up to length 255, while a value
  * can either be an arbitrary binary, or a subtree allowing for hierarchical relational organization.
  */
 
