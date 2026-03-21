@@ -9,7 +9,7 @@ endif
 
 # The Test Executable
 test_avatree_exe = executable('test_avatree',
-  sources : ['test_avatree.cpp', '../src/avatree.c'], # Link the C source directly
+  sources : ['test_avatree.cpp', '../src/avatree.c', '../src/avapager.c'], # Link the C source directly
   include_directories : include_directories('../include'),
   dependencies : [gtest_dep],
   cpp_args : '-DAVA_TESTING'

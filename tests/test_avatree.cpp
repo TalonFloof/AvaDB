@@ -8,61 +8,67 @@
 #include <avadb/avatree.h>
 #include <avadb/avapager.h>
 
-// This exists to create a mockup pager that lies in-memory rather than needing an externally backed source
-struct MockStorage {
-    // Use pointers to ensure the address of a page never changes even if the vector resizes.
-    std::vector<uint8_t*> pages;
-    size_t page_size = 4096;
+/* --- Mock Interface --- */
 
-    void reset() {
-        for (auto p : pages) delete[] p;
-        pages.clear();
-        // Page 0 is reserved for the header
-        pages.push_back(new uint8_t[page_size]());
-    }
-
-    ~MockStorage() {
-        for (auto p : pages) delete[] p;
-    }
+struct MockFile {
+    std::vector<uint8_t> data;
 };
 
-// Global instance for the C callbacks to access
-static MockStorage global_mock;
-
-extern "C" {
-    void* ava_pager_read(AvaPager* pager, ava_pgid_t index) {
-        if (index >= global_mock.pages.size()) return nullptr;
-        return global_mock.pages[index];
+static size_t mock_read(AvaOSInterface* self, AvaFile* file, void* buffer, size_t size, uint64_t offset) {
+    MockFile* mfile = (MockFile*)file;
+    if (offset + size > mfile->data.size()) {
+        mfile->data.resize(offset + size, 0);
     }
+    memcpy(buffer, mfile->data.data() + offset, size);
+    return size;
+}
 
-    void ava_pager_mark_dirty(AvaPager* pager, ava_pgid_t index) {
-        // Stub since this is in-memory
+static size_t mock_write(AvaOSInterface* self, AvaFile* file, void* buffer, size_t size, uint64_t offset) {
+    MockFile* mfile = (MockFile*)file;
+    size_t end_pos = offset + size;
+    if (end_pos > mfile->data.size()) {
+        mfile->data.resize(end_pos, 0);
     }
+    memcpy(mfile->data.data() + offset, buffer, size);
+    return size;
+}
 
-    bool ava_pager_allocate(AvaPager* pager, ava_pgid_t* new_index) {
-        ava_pgid_t id = global_mock.pages.size();
-        global_mock.pages.push_back(new uint8_t[global_mock.page_size]());
-        *new_index = id;
-        return true;
-    }
-    
-    // Stubs for functions not used by avatree.c logic but required by linker if linked aggressively
-    void ava_pager_sync(AvaPager* pager) {}
+static size_t mock_getsize(AvaOSInterface* self, AvaFile* file) {
+    MockFile* mfile = (MockFile*)file;
+    return mfile->data.size();
+}
+
+static size_t mock_truncate(AvaOSInterface* self, AvaFile* file, size_t size) {
+    MockFile* mfile = (MockFile*)file;
+    mfile->data.resize(size, 0);
+    return size;
 }
 
 /* Test class */
 class AvaTreeTest : public ::testing::Test {
 protected:
     AvaPager pager;
+    AvaOSInterface mock_interface;
+    MockFile mock_file;
+    AvaOSInterface* p_interface;
+    AvaFile* p_file;
 
     void SetUp() override {
-        global_mock.reset();
         memset(&pager, 0, sizeof(AvaPager));
-        pager.page_size = global_mock.page_size;
+        
+        mock_interface.read = mock_read;
+        mock_interface.write = mock_write;
+        mock_interface.getsize = mock_getsize;
+        mock_interface.truncate = mock_truncate;
+        
+        p_interface = &mock_interface;
+        p_file = (AvaFile*)&mock_file;
+        
+        ava_pager_init(&pager, &p_interface, &p_file);
     }
 
     void TearDown() override {
-        global_mock.reset();
+        ava_pager_deinit(&pager);
     }
 
     /* 
@@ -72,7 +78,7 @@ protected:
     void VerifyTree(ava_pgid_t page_id, bool is_root = false) {
         if (page_id == 0) return;
         
-        void* ptr = ava_pager_read(&pager, page_id);
+        void* ptr = ava_pager_get(&pager, page_id);
         ASSERT_NE(ptr, nullptr) << "Page " << page_id << " is inaccessible";
         
         AvaTreePageHeader* page = (AvaTreePageHeader*)ptr;
@@ -83,6 +89,7 @@ protected:
             
         ASSERT_LE(page->header.node.num_entries, 1000) << "Page " << page_id << " has suspicious entry count";
         ASSERT_LE(page->header.node.free_end, pager.page_size) << "Page " << page_id << " free_end out of bounds";
+        ava_pager_unpin(&pager, page_id);
     }
     
     void DumpSeed(unsigned int seed) {
@@ -102,13 +109,15 @@ TEST_F(AvaTreeTest, InsertAndSearchBasic) {
                            (char*)val.c_str(), val.size() + 1, AVA_VALUE_TYPE_STRING);
 
     // Search
-    AvaTreeLeafCell* res = ava_tree_search(&pager, root, (char*)key.c_str(), key.size());
+    ava_pgid_t leaf_pgid = 0;
+    AvaTreeLeafCell* res = ava_tree_search(&pager, root, (char*)key.c_str(), key.size(), &leaf_pgid);
     
     ASSERT_NE(res, nullptr);
     ASSERT_EQ(res->key_size, key.size());
     
     char* stored_val = (char*)(res->payload + res->key_size);
     EXPECT_STREQ(stored_val, val.c_str());
+    ava_pager_unpin(&pager, leaf_pgid);
 }
 
 TEST_F(AvaTreeTest, InsertUpdatesRootOnSplit) {
@@ -132,13 +141,16 @@ TEST_F(AvaTreeTest, InsertUpdatesRootOnSplit) {
         std::string key = "k-" + std::to_string(i);
         std::string val = "val-" + std::to_string(i);
         
-        AvaTreeLeafCell* res = ava_tree_search(&pager, root, (char*)key.c_str(), key.size());
+        ava_pgid_t leaf_pgid = 0;
+        AvaTreeLeafCell* res = ava_tree_search(&pager, root, (char*)key.c_str(), key.size(), &leaf_pgid);
         ASSERT_NE(res, nullptr) << "Key failed lookup: " << key;
         
         char* stored_val = (char*)(res->payload + res->key_size);
         EXPECT_STREQ(stored_val, val.c_str());
+        ava_pager_unpin(&pager, leaf_pgid);
     }
 }
+
 
 TEST_F(AvaTreeTest, DeleteBasic) {
     ava_pgid_t root = 0;
@@ -159,17 +171,22 @@ TEST_F(AvaTreeTest, DeleteBasic) {
     // Verify
     for (int i = 0; i < count; i++) {
         std::string key = "k" + std::to_string(i);
-        AvaTreeLeafCell* res = ava_tree_search(&pager, root, (char*)key.c_str(), key.size());
+        ava_pgid_t leaf_pgid = 0;
+        AvaTreeLeafCell* res = ava_tree_search(&pager, root, (char*)key.c_str(), key.size(), &leaf_pgid);
         
         if (i % 2 == 0) {
             EXPECT_EQ(res, nullptr) << "Key should be deleted: " << key;
         } else {
             EXPECT_NE(res, nullptr) << "Key should exist: " << key;
         }
+        if (res) ava_pager_unpin(&pager, leaf_pgid);
     }
 }
 
-TEST_F(AvaTreeTest, FuzzRandomOps) {
+/* This is one of the most important tests cases, it does random insertions and deletions
+ * to stress test the B+ Tree implementation, making sure it can handle all edge cases
+ */
+TEST_F(AvaTreeTest, RandomOps) {
     ava_pgid_t root = 0;
     int iterations = 10000;
     int range = 1000;
@@ -201,9 +218,11 @@ TEST_F(AvaTreeTest, FuzzRandomOps) {
         if (i % 1000 == 0) {
             for(int j=0; j<range; j++) {
                 std::string ck = "rk-" + std::to_string(j);
-                AvaTreeLeafCell* res = ava_tree_search(&pager, root, (char*)ck.c_str(), ck.size());
+                ava_pgid_t leaf_pgid = 0;
+                AvaTreeLeafCell* res = ava_tree_search(&pager, root, (char*)ck.c_str(), ck.size(), &leaf_pgid);
                 if (exists[j]) ASSERT_NE(res, nullptr) << "Failed to find key: " << ck << " at iter " << i;
                 else ASSERT_EQ(res, nullptr);
+                if (res) ava_pager_unpin(&pager, leaf_pgid);
             }
             VerifyTree(root, true);
         }
@@ -217,24 +236,26 @@ TEST_F(AvaTreeTest, InsertOverflowTest) {
     ava_pgid_t root = 0;
     std::string key = "key";
 
-    size_t large_size = 1024 * 10;
+    size_t large_size = 1024 * 1024 * 5 / 2;
     std::vector<char> large_data(large_size);
     for (size_t i=0; i < large_size; i++)
         large_data[i] = static_cast<char>(i % 256);
     root = ava_tree_insert(&pager, root, (char*)key.c_str(), key.size(), large_data.data(), large_size, AVA_VALUE_TYPE_BLOB);
 
     // Search for the key
-    AvaTreeLeafCell* res = ava_tree_search(&pager, root, (char*)key.c_str(), key.size());
+    ava_pgid_t leaf_pgid = 0;
+    AvaTreeLeafCell* res = ava_tree_search(&pager, root, (char*)key.c_str(), key.size(), &leaf_pgid);
     ASSERT_NE(res, nullptr) << "Couldn't retrieve key!";
     EXPECT_TRUE(res->value_type & AVA_VALUE_FLAG_OVERFLOW) << "Value wasn't set with overflow flag!";
     EXPECT_EQ(res->value_size, sizeof(ava_pgid_t)) << "Size didn't match sizeof(ava_pgid_t), got " << res->value_size;
 
     // Verify that the data was saved correctly
     ava_pgid_t page_id = *(ava_pgid_t*)(res->payload + res->key_size);
+    ava_pager_unpin(&pager, leaf_pgid);
     std::vector<char> read_back;
 
     while (page_id != 0) {
-        AvaTreePageHeader* ovf = (AvaTreePageHeader*)ava_pager_read(&pager, page_id);
+        AvaTreePageHeader* ovf = (AvaTreePageHeader*)ava_pager_get(&pager, page_id);
         EXPECT_EQ(ovf->type,AVA_PAGE_TYPE_OVERFLOW) << "Page #" << page_id << "was not set as type AVA_PAGE_TYPE_OVERFLOW!";
         size_t header_sz = sizeof(AvaTreePageHeader);
         size_t cap = pager.page_size - header_sz;
@@ -242,6 +263,7 @@ TEST_F(AvaTreeTest, InsertOverflowTest) {
         size_t chunk = (remaining < cap) ? remaining : cap;
 
         read_back.insert(read_back.end(), reinterpret_cast<char *>(ovf) + sizeof(AvaTreePageHeader), (reinterpret_cast<char *>(ovf) + sizeof(AvaTreePageHeader))+chunk);
+        ava_pager_unpin(&pager, page_id);
         page_id = ovf->header.overflow.next;
     }
 
@@ -270,8 +292,10 @@ TEST_F(AvaTreeTest, DeleteOverflowTest) {
     root = ava_tree_delete(&pager, root, (char*)key.c_str(), key.size());
 
     // Verify key is gone
-    AvaTreeLeafCell* res = ava_tree_search(&pager, root, (char*)key.c_str(), key.size());
+    ava_pgid_t leaf_pgid = 0;
+    AvaTreeLeafCell* res = ava_tree_search(&pager, root, (char*)key.c_str(), key.size(), &leaf_pgid);
     EXPECT_EQ(res, nullptr);
+    if (res) ava_pager_unpin(&pager, leaf_pgid);
 
     // TODO: Check Overflow Chain to make sure its actually freed
 }

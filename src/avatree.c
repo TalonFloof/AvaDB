@@ -12,15 +12,16 @@ static ava_pgid_t create_overflow_chain(AvaPager* pager, char* data, uint32_t si
     while (written < size) {
         ava_pgid_t new_page;
         ava_pager_allocate(pager, &new_page);
-        AvaTreePageHeader* page = ava_pager_read(pager, new_page);
+        AvaTreePageHeader* page = ava_pager_get(pager, new_page);
         page->type = AVA_PAGE_TYPE_OVERFLOW;
 
         if (first_page == 0)
             first_page = new_page;
         else {
-            AvaTreePageHeader* prev = ava_pager_read(pager, current_page);
+            AvaTreePageHeader* prev = ava_pager_get(pager, current_page);
             prev->header.overflow.next = new_page;
             ava_pager_mark_dirty(pager, current_page);
+            ava_pager_unpin(pager, current_page);
         }
 
         current_page = new_page;
@@ -31,17 +32,17 @@ static ava_pgid_t create_overflow_chain(AvaPager* pager, char* data, uint32_t si
         memcpy((uint8_t*)page + sizeof(AvaTreePageHeader), data + written, to_write);
         ava_pager_mark_dirty(pager, current_page);
         written += to_write;
+        ava_pager_unpin(pager, new_page);
     }
     return first_page;
 }
 
 static void free_overflow_chain(AvaPager* pager, ava_pgid_t chain_head_page) {
     for (ava_pgid_t cur = chain_head_page; cur != 0;) {
-        AvaTreePageHeader* page = ava_pager_read(pager, cur);
+        AvaTreePageHeader* page = ava_pager_get(pager, cur);
         ava_pgid_t next = page->header.overflow.next;
-        /* TODO: Add page to freelist */
-        page->type = AVA_PAGE_TYPE_FREE;
-        ava_pager_mark_dirty(pager,cur);
+        ava_pager_free(pager, cur);
+        ava_pager_unpin(pager, cur);
         cur = next;
     }
 }
@@ -249,10 +250,10 @@ typedef struct {
 } AvaSplitResult;
 
 static void leaf_node_split(AvaPager* pager, AvaTreePageHeader* old_page, char* new_key, uint8_t new_key_size, char* new_value, uint32_t new_value_size, uint8_t new_value_type, AvaSplitResult* result) {
-    /* 1. Allocate New Page */
+    /* Allocate new page for split */
     result->did_split = 1;
     ava_pager_allocate(pager,&result->new_page_id);
-    AvaTreePageHeader* new_page = ava_pager_read(pager, result->new_page_id);
+    AvaTreePageHeader* new_page = ava_pager_get(pager, result->new_page_id);
     ava_pager_mark_dirty(pager, result->new_page_id);
 
     new_page->type = AVA_PAGE_TYPE_LEAF;
@@ -300,6 +301,7 @@ static void leaf_node_split(AvaPager* pager, AvaTreePageHeader* old_page, char* 
     /* Set out result (copy of the first key of the right sibling) */
     first_new = get_cell_content(new_page, 0);
     result->promoted_key_size = first_new->key_size;
+    ava_pager_unpin(pager, result->new_page_id);
     memcpy(result->promoted_key, first_new->payload, first_new->key_size);
 }
 
@@ -364,7 +366,7 @@ static void internal_node_split(AvaPager* pager, AvaTreePageHeader* old_page, av
 
     /* Get a new page and initialize it */
     ava_pager_allocate(pager,&result->new_page_id);
-    AvaTreePageHeader* new_page = ava_pager_read(pager, result->new_page_id);
+    AvaTreePageHeader* new_page = ava_pager_get(pager, result->new_page_id);
     ava_pager_mark_dirty(pager, result->new_page_id);
 
     /* Clear old page and initialize new page */
@@ -386,6 +388,7 @@ static void internal_node_split(AvaPager* pager, AvaTreePageHeader* old_page, av
     }
     new_page->header.node.right_sibling = all_children[total_items];
 
+    ava_pager_unpin(pager, result->new_page_id);
     free(all_entries);
     free(all_children);
 }
@@ -393,7 +396,7 @@ static void internal_node_split(AvaPager* pager, AvaTreePageHeader* old_page, av
 static void leaf_node_delete(AvaTreePageHeader* page, uint16_t index);
 
 static void ava_tree_insert_recursive(AvaPager* pager, ava_pgid_t page_id, char* key, uint8_t key_size, char* value, uint32_t value_size, uint8_t value_type, AvaSplitResult* result) {
-    AvaTreePageHeader* page = ava_pager_read(pager, page_id);
+    AvaTreePageHeader* page = ava_pager_get(pager, page_id);
     result->did_split = 0;
     if (page->type == AVA_PAGE_TYPE_LEAF) {
         uint16_t insert_index;
@@ -422,6 +425,7 @@ static void ava_tree_insert_recursive(AvaPager* pager, ava_pgid_t page_id, char*
             ava_pager_mark_dirty(pager, page_id);
             leaf_node_split(pager, page, key, key_size, value, value_size, value_type, result);
         }
+        ava_pager_unpin(pager, page_id);
         return;
     }
     uint16_t index;
@@ -468,6 +472,7 @@ static void ava_tree_insert_recursive(AvaPager* pager, ava_pgid_t page_id, char*
             internal_node_split(pager, page, result->new_page_id, (char*)result->promoted_key, result->promoted_key_size, result);
         }
     }
+    ava_pager_unpin(pager, page_id);
 }
 
 #define AVA_DELETE_OK 0
@@ -562,8 +567,7 @@ static void merge_with_right_leaf(AvaPager* pager, ava_pgid_t parent_id, AvaTree
     }
 
     child_page->header.node.right_sibling = right_sibling_page->header.node.right_sibling;
-    /* TODO: Add right_sibling_page to free list */
-    right_sibling_page->type = AVA_PAGE_TYPE_FREE;
+    ava_pager_free(pager, right_sibling_pgid);
 
     if (child_index + 1 < parent_page->header.node.num_entries) {
          AvaTreeInternalCell* next_cell = get_cell_content(parent_page, child_index + 1);
@@ -585,8 +589,7 @@ static void merge_with_left_leaf(AvaPager* pager, ava_pgid_t parent_id, AvaTreeP
     }
 
     left_sibling_page->header.node.right_sibling = child_page->header.node.right_sibling;
-    /* TODO: Add child_page to free list */
-    child_page->type = AVA_PAGE_TYPE_FREE;
+    ava_pager_free(pager, child_pgid);
 
     if (child_index < parent_page->header.node.num_entries) {
         AvaTreeInternalCell* cell_at_child = get_cell_content(parent_page, child_index);
@@ -644,8 +647,7 @@ static void merge_with_right_internal(AvaPager* pager, ava_pgid_t parent_id, Ava
          internal_node_insert(pager, child_page, child_page->header.node.num_entries, cell->left_child, (char*)cell->key, cell->key_size);
     }
     child_page->header.node.right_sibling = right_sibling_page->header.node.right_sibling;
-    /* TODO: Add right_sibling_page to free list */
-    right_sibling_page->type = AVA_PAGE_TYPE_FREE;
+    ava_pager_free(pager, right_sibling_pgid);
 
     if (child_index + 1 < parent_page->header.node.num_entries) {
          AvaTreeInternalCell* next_cell = get_cell_content(parent_page, child_index + 1);
@@ -669,8 +671,7 @@ static void merge_with_left_internal(AvaPager* pager, ava_pgid_t parent_id, AvaT
          internal_node_insert(pager, left_sibling_page, left_sibling_page->header.node.num_entries, cell->left_child, (char*)cell->key, cell->key_size);
     }
     left_sibling_page->header.node.right_sibling = child_page->header.node.right_sibling;
-    /* TODO: Add child_page to free list */
-    child_page->type = AVA_PAGE_TYPE_FREE;
+    ava_pager_free(pager, child_pgid);
     
     if (child_index < parent_page->header.node.num_entries) {
         AvaTreeInternalCell* cell_at_child = get_cell_content(parent_page, child_index);
@@ -683,26 +684,29 @@ static void merge_with_left_internal(AvaPager* pager, ava_pgid_t parent_id, AvaT
 
 static int handle_node_underflow(AvaPager* pager, AvaTreePageHeader* parent_page, ava_pgid_t parent_id, uint16_t child_index) {
     ava_pgid_t child_pgid = get_child_pgid(parent_page, child_index);
-    AvaTreePageHeader* child_page = ava_pager_read(pager, child_pgid);
+    AvaTreePageHeader* child_page = ava_pager_get(pager, child_pgid);
     
     ava_pgid_t right_sibling_pgid = 0;
     AvaTreePageHeader* right_sibling_page = NULL;
     if (child_index < parent_page->header.node.num_entries) {
         right_sibling_pgid = get_child_pgid(parent_page, child_index + 1);
-        right_sibling_page = ava_pager_read(pager, right_sibling_pgid);
+        right_sibling_page = ava_pager_get(pager, right_sibling_pgid);
     }
 
     ava_pgid_t left_sibling_pgid = 0;
     AvaTreePageHeader* left_sibling_page = NULL;
     if (child_index > 0) {
         left_sibling_pgid = get_child_pgid(parent_page, child_index - 1);
-        left_sibling_page = ava_pager_read(pager, left_sibling_pgid);
+        left_sibling_page = ava_pager_get(pager, left_sibling_pgid);
     }
 
     /* Attempt to borrow from right sibling */
     if (right_sibling_page && !is_node_underflow(pager, right_sibling_page) && right_sibling_page->header.node.num_entries > 1) {
         if (child_page->type == AVA_PAGE_TYPE_LEAF) borrow_from_right_leaf(pager, parent_id, parent_page, child_index, child_pgid, child_page, right_sibling_pgid, right_sibling_page);
         else borrow_from_right_internal(pager, parent_id, parent_page, child_index, child_pgid, child_page, right_sibling_pgid, right_sibling_page);
+        ava_pager_unpin(pager, child_pgid);
+        if (right_sibling_page) ava_pager_unpin(pager, right_sibling_pgid);
+        if (left_sibling_page) ava_pager_unpin(pager, left_sibling_pgid);
         return AVA_DELETE_OK;
     }
 
@@ -710,6 +714,9 @@ static int handle_node_underflow(AvaPager* pager, AvaTreePageHeader* parent_page
     if (left_sibling_page && !is_node_underflow(pager, left_sibling_page) && left_sibling_page->header.node.num_entries > 1) {
         if (child_page->type == AVA_PAGE_TYPE_LEAF) borrow_from_left_leaf(pager, parent_id, parent_page, child_index, child_pgid, child_page, left_sibling_pgid, left_sibling_page);
         else borrow_from_left_internal(pager, parent_id, parent_page, child_index, child_pgid, child_page, left_sibling_pgid, left_sibling_page);
+        ava_pager_unpin(pager, child_pgid);
+        if (right_sibling_page) ava_pager_unpin(pager, right_sibling_pgid);
+        if (left_sibling_page) ava_pager_unpin(pager, left_sibling_pgid);
         return AVA_DELETE_OK;
     }
 
@@ -723,12 +730,20 @@ static int handle_node_underflow(AvaPager* pager, AvaTreePageHeader* parent_page
         else merge_with_left_internal(pager, parent_id, parent_page, child_index, child_pgid, child_page, left_sibling_pgid, left_sibling_page);
     }
 
-    if (is_node_underflow(pager, parent_page)) return AVA_DELETE_UNDERFLOW;
+    if (is_node_underflow(pager, parent_page)) {
+        ava_pager_unpin(pager, child_pgid);
+        if (right_sibling_page) ava_pager_unpin(pager, right_sibling_pgid);
+        if (left_sibling_page) ava_pager_unpin(pager, left_sibling_pgid);
+        return AVA_DELETE_UNDERFLOW;
+    }
+    ava_pager_unpin(pager, child_pgid);
+    if (right_sibling_page) ava_pager_unpin(pager, right_sibling_pgid);
+    if (left_sibling_page) ava_pager_unpin(pager, left_sibling_pgid);
     return AVA_DELETE_OK;
 }
 
 static int ava_tree_delete_recursive(AvaPager* pager, ava_pgid_t page_id, char* key, uint8_t key_size) {
-    AvaTreePageHeader* page = ava_pager_read(pager, page_id);
+    AvaTreePageHeader* page = ava_pager_get(pager, page_id);
 
     if (page->type == AVA_PAGE_TYPE_LEAF) {
         uint16_t index;
@@ -745,10 +760,13 @@ static int ava_tree_delete_recursive(AvaPager* pager, ava_pgid_t page_id, char* 
             leaf_node_delete(page, index);
 
             if (is_node_underflow(pager, page)) {
+                ava_pager_unpin(pager, page_id);
                 return AVA_DELETE_UNDERFLOW;
             }
+            ava_pager_unpin(pager, page_id);
             return AVA_DELETE_OK;
         }
+        ava_pager_unpin(pager, page_id);
         return AVA_DELETE_OK; /* Not found */
     }
 
@@ -769,21 +787,28 @@ static int ava_tree_delete_recursive(AvaPager* pager, ava_pgid_t page_id, char* 
     if (result == AVA_DELETE_UNDERFLOW) {
         /* The child we descended from has underflowed. We need to fix it. */
         if (page->type == AVA_PAGE_TYPE_INTERNAL) {
-            return handle_node_underflow(pager, page, page_id, index);
+            int res = handle_node_underflow(pager, page, page_id, index);
+            ava_pager_unpin(pager, page_id);
+            return res;
         } else {
             /* This case (a leaf's child underflowing) is impossible. */
+            ava_pager_unpin(pager, page_id);
             return AVA_DELETE_OK;
         }
     }
 
+    ava_pager_unpin(pager, page_id);
     return AVA_DELETE_OK;
 }
 
 /* High-level Tree Functions */
-AvaTreeLeafCell* ava_tree_search(AvaPager* pager, ava_pgid_t root_pgid, char* key, uint8_t key_size) {
-    if (root_pgid == 0) return NULL; /* Sanity check */
+AvaTreeLeafCell* ava_tree_search(AvaPager* pager, ava_pgid_t root_pgid, char* key, uint8_t key_size, ava_pgid_t* pgid_index) {
+    /* Sanity checks */
+    if (root_pgid == 0) return NULL;
+    if (pgid_index == NULL) return NULL;
+
     ava_pgid_t current_pgid = root_pgid;
-    AvaTreePageHeader* page = ava_pager_read(pager, current_pgid);
+    AvaTreePageHeader* page = ava_pager_get(pager, current_pgid);
     while (page->type == AVA_PAGE_TYPE_INTERNAL) {
         uint16_t index;
         int found = node_find_key(page, key, key_size, &index);
@@ -804,14 +829,19 @@ AvaTreeLeafCell* ava_tree_search(AvaPager* pager, ava_pgid_t root_pgid, char* ke
             next_pgid = cell->left_child;
         }
         /* Retrieve the next page */
+        ava_pager_unpin(pager, current_pgid);
         current_pgid = next_pgid;
-        page = (AvaTreePageHeader*)ava_pager_read(pager, current_pgid);
+        page = (AvaTreePageHeader*)ava_pager_get(pager, current_pgid);
     }
     /* We are at a leaf node, find the cell associated with our key */
     uint16_t index;
     int found = node_find_key(page, key, key_size, &index);
-    if (found)
+    if (found) {
+        /* The caller is responsible for unpinning the page, hence why we can pass the index to it */
+        *pgid_index = current_pgid;
         return get_cell_content(page, index);
+    }
+    ava_pager_unpin(pager, current_pgid);
     return NULL;
 }
 
@@ -829,7 +859,7 @@ ava_pgid_t ava_tree_insert(AvaPager* pager, ava_pgid_t root, char* key, uint8_t 
     if (root == 0) {
         ava_pgid_t root_pgid;
         ava_pager_allocate(pager, &root_pgid);
-        AvaTreePageHeader* root_page = ava_pager_read(pager, root_pgid);
+        AvaTreePageHeader* root_page = ava_pager_get(pager, root_pgid);
         ava_pager_mark_dirty(pager, root_pgid); /* Mark page as dirty for modification */
 
         /* Initialize the new leaf page */
@@ -841,6 +871,7 @@ ava_pgid_t ava_tree_insert(AvaPager* pager, ava_pgid_t root, char* key, uint8_t 
         /* Insert the first element into this new page. The index is always 0. */
         leaf_node_insert(pager, root_page, 0, key, key_size, value, value_size, value_type);
 
+        ava_pager_unpin(pager, root_pgid);
         return root_pgid;
     } else {
         AvaSplitResult result;
@@ -850,7 +881,7 @@ ava_pgid_t ava_tree_insert(AvaPager* pager, ava_pgid_t root, char* key, uint8_t 
             /* The root itself split. We must create a new root. */
             ava_pgid_t new_root_id;
             ava_pager_allocate(pager,&new_root_id);
-            AvaTreePageHeader* new_root = ava_pager_read(pager, new_root_id);
+            AvaTreePageHeader* new_root = ava_pager_get(pager, new_root_id);
             ava_pager_mark_dirty(pager, new_root_id);
 
             new_root->type = AVA_PAGE_TYPE_INTERNAL;
@@ -860,9 +891,11 @@ ava_pgid_t ava_tree_insert(AvaPager* pager, ava_pgid_t root, char* key, uint8_t 
             /* The new root has two children: the old root and the new page from the split */
             new_root->header.node.right_sibling = result.new_page_id;
             internal_node_insert(pager, new_root, 0, root, (char*)result.promoted_key, result.promoted_key_size);
+            ava_pager_unpin(pager, root);
+            ava_pager_unpin(pager, new_root_id);
             return new_root_id;
         }
-
+        ava_pager_unpin(pager, root);
         return root;
     }
 }
@@ -873,14 +906,12 @@ ava_pgid_t ava_tree_delete(AvaPager* pager, ava_pgid_t root, char* key, uint8_t 
     ava_tree_delete_recursive(pager, root, key, key_size);
 
     /* Handle Root Collapse: If internal root has 0 entries (only 1 child pointer), promote the child */
-    AvaTreePageHeader* root_page = ava_pager_read(pager, root);
+    AvaTreePageHeader* root_page = ava_pager_get(pager, root);
     if (root_page->type == AVA_PAGE_TYPE_INTERNAL && root_page->header.node.num_entries == 0) {
         ava_pgid_t new_root = root_page->header.node.right_sibling;
-        /* TODO: Add old root page to freelist */
-        root_page->type = AVA_PAGE_TYPE_FREE;
-        ava_pager_mark_dirty(pager, root);
+        ava_pager_unpin(pager, root);
         return new_root;
     }
-
+    ava_pager_unpin(pager, root);
     return root;
 }

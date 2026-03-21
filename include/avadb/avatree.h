@@ -77,7 +77,7 @@ typedef packed_struct AvaTreeLeafCell {
 
 ava_pgid_t ava_tree_insert(AvaPager* pager, ava_pgid_t root, char* key, uint8_t key_size, char* value, uint32_t value_size, uint8_t value_type);
 ava_pgid_t ava_tree_delete(AvaPager* pager, ava_pgid_t root, char* key, uint8_t key_size);
-AvaTreeLeafCell* ava_tree_search(AvaPager* pager, ava_pgid_t root, char* key, uint8_t key_size);
+AvaTreeLeafCell* ava_tree_search(AvaPager* pager, ava_pgid_t root, char* key, uint8_t key_size, ava_pgid_t* pgid_index);
 
 #ifdef __cplusplus
 }
