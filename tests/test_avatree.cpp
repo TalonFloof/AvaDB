@@ -7,6 +7,7 @@
 
 #include <avadb/avatree.h>
 #include <avadb/avapager.h>
+#include <avadb/endian.h>
 
 /* --- Mock Interface --- */
 
@@ -89,8 +90,8 @@ protected:
         ASSERT_TRUE(page->type == AVA_PAGE_TYPE_LEAF || page->type == AVA_PAGE_TYPE_INTERNAL) 
             << "Page " << page_id << " has invalid type " << (int)page->type;
             
-        ASSERT_LE(page->header.node.num_entries, 1000) << "Page " << page_id << " has suspicious entry count";
-        ASSERT_LE(page->header.node.free_end, pager.page_size) << "Page " << page_id << " free_end out of bounds";
+        ASSERT_LE(le16toh(page->header.node.num_entries), 1000) << "Page " << page_id << " has suspicious entry count";
+        ASSERT_LE(le16toh(page->header.node.free_end), pager.page_size) << "Page " << page_id << " free_end out of bounds";
         ava_pager_unpin(&pager, page_id);
     }
     
@@ -249,10 +250,10 @@ TEST_F(AvaTreeTest, InsertOverflowTest) {
     AvaTreeLeafCell* res = ava_tree_search(&pager, root, (char*)key.c_str(), key.size(), &leaf_pgid);
     ASSERT_NE(res, nullptr) << "Couldn't retrieve key!";
     EXPECT_TRUE(res->value_type & AVA_VALUE_FLAG_OVERFLOW) << "Value wasn't set with overflow flag!";
-    EXPECT_EQ(res->value_size, sizeof(ava_pgid_t)) << "Size didn't match sizeof(ava_pgid_t), got " << res->value_size;
+    EXPECT_EQ(le32toh(res->value_size), sizeof(ava_pgid_t)) << "Size didn't match sizeof(ava_pgid_t), got " << le32toh(res->value_size);
 
     // Verify that the data was saved correctly
-    ava_pgid_t page_id = *(ava_pgid_t*)(res->payload + res->key_size);
+    ava_pgid_t page_id = le64toh(*(ava_pgid_t*)(res->payload + res->key_size));
     ava_pager_unpin(&pager, leaf_pgid);
     std::vector<char> read_back;
 
@@ -265,8 +266,9 @@ TEST_F(AvaTreeTest, InsertOverflowTest) {
         size_t chunk = (remaining < cap) ? remaining : cap;
 
         read_back.insert(read_back.end(), reinterpret_cast<char *>(ovf) + sizeof(AvaTreePageHeader), (reinterpret_cast<char *>(ovf) + sizeof(AvaTreePageHeader))+chunk);
+        ava_pgid_t next_page = le64toh(ovf->header.overflow.next);
         ava_pager_unpin(&pager, page_id);
-        page_id = ovf->header.overflow.next;
+        page_id = next_page;
     }
 
     ASSERT_EQ(read_back.size(), large_size) << "Size mismatch, expected " << large_size << " got " << read_back.size();
