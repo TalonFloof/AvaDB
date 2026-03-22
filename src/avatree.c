@@ -1,6 +1,7 @@
 #include <avadb/avatree.h>
 #include <string.h>
 #include <stdlib.h>
+#include <avadb/endian.h>
 
 /* Overflow page management */
 
@@ -20,7 +21,7 @@ static ava_pgid_t create_overflow_chain(AvaPager* pager, char* data, uint32_t si
             first_page = new_page;
         else {
             AvaTreePageHeader* prev = ava_pager_get(pager, current_page);
-            prev->header.overflow.next = new_page;
+            prev->header.overflow.next = htole64(new_page);
             ava_pager_mark_dirty(pager, current_page);
             ava_pager_unpin(pager, current_page);
         }
@@ -40,7 +41,7 @@ static ava_pgid_t create_overflow_chain(AvaPager* pager, char* data, uint32_t si
 static void free_overflow_chain(AvaPager* pager, ava_pgid_t chain_head_page) {
     for (ava_pgid_t cur = chain_head_page; cur != 0;) {
         AvaTreePageHeader* page = ava_pager_get(pager, cur);
-        ava_pgid_t next = page->header.overflow.next;
+        ava_pgid_t next = le64toh(page->header.overflow.next);
         ava_pager_free(pager, cur);
         ava_pager_unpin(pager, cur);
         cur = next;
@@ -54,18 +55,18 @@ static AvaTreeCellPtr* get_cell_ptrs(AvaTreePageHeader* page) {
 }
 static void* get_cell_content(AvaTreePageHeader* page, uint16_t index) {
     AvaTreeCellPtr* ptrs = get_cell_ptrs(page);
-    return (uint8_t*)page + ptrs[index].offset;
+    return (uint8_t*)page + le16toh(ptrs[index].offset);
 }
 static uint32_t get_node_free_space(AvaTreePageHeader* page) {
     uint32_t free_start = sizeof(AvaTreePageHeader) + 
-                          (page->header.node.num_entries * sizeof(AvaTreeCellPtr));
-    uint32_t free_end = page->header.node.free_end;
+                          (le16toh(page->header.node.num_entries) * sizeof(AvaTreeCellPtr));
+    uint32_t free_end = le16toh(page->header.node.free_end);
     if (free_end < free_start) return 0; /* Shouldn't happen in normal circumstances, but this check is done for safety */
     return free_end - free_start;
 }
 
 static void compact_page(AvaPager* pager, AvaTreePageHeader* page) {
-    uint16_t num_entries = page->header.node.num_entries;
+    uint16_t num_entries = le16toh(page->header.node.num_entries);
     uint32_t header_size = sizeof(AvaTreePageHeader) + (num_entries * sizeof(AvaTreeCellPtr));
 
     uint8_t* temp_buffer = malloc(pager->page_size);
@@ -74,16 +75,17 @@ static void compact_page(AvaPager* pager, AvaTreePageHeader* page) {
     AvaTreeCellPtr* temp_ptrs = (AvaTreeCellPtr*)(temp_buffer + sizeof(AvaTreePageHeader));
     
     /* Reset the real page's free pointer */
-    page->header.node.free_end = pager->page_size;
+    page->header.node.free_end = htole16(pager->page_size);
     
     for (uint16_t i = 0; i < num_entries; i++) {
-        uint32_t size = temp_ptrs[i].size;
-        void* data = temp_buffer + temp_ptrs[i].offset;
+        uint32_t size = le16toh(temp_ptrs[i].size);
+        void* data = temp_buffer + le16toh(temp_ptrs[i].offset);
         
-        page->header.node.free_end -= size;
-        memcpy((uint8_t*)page + page->header.node.free_end, data, size);
+        uint16_t new_free_end = le16toh(page->header.node.free_end) - size;
+        page->header.node.free_end = htole16(new_free_end);
+        memcpy((uint8_t*)page + new_free_end, data, size);
         
-        ptrs[i].offset = page->header.node.free_end;
+        ptrs[i].offset = htole16(new_free_end);
     }
     free(temp_buffer);
 }
@@ -92,7 +94,7 @@ static void compact_page(AvaPager* pager, AvaTreePageHeader* page) {
 
 static int node_find_key(AvaTreePageHeader* page, char* key, uint8_t key_size, uint16_t* out_index) {
     uint16_t low = 0;
-    uint16_t high = page->header.node.num_entries;
+    uint16_t high = le16toh(page->header.node.num_entries);
     while (low < high) {
         uint16_t mid = (low + high) / 2;
         /* get pointer to the key based on Node Type */
@@ -137,8 +139,9 @@ static void leaf_node_insert(AvaPager* pager, AvaTreePageHeader* page, uint16_t 
     if (get_node_free_space(page) < cell_content_size + sizeof(AvaTreeCellPtr)) {
         compact_page(pager, page);
     }
-    page->header.node.free_end -= cell_content_size;
-    ava_off_t new_cell_offset = page->header.node.free_end;
+    uint16_t current_free_end = le16toh(page->header.node.free_end);
+    page->header.node.free_end = htole16(current_free_end - cell_content_size);
+    ava_off_t new_cell_offset = le16toh(page->header.node.free_end);
 
     AvaTreeCellPtr* ptrs = get_cell_ptrs(page);
     AvaTreeLeafCell* new_cell = (AvaTreeLeafCell*)((uint8_t*)page + new_cell_offset);
@@ -146,16 +149,16 @@ static void leaf_node_insert(AvaPager* pager, AvaTreePageHeader* page, uint16_t 
     /* Shift existing pointers to the right to ensure entries are aligned */
     memmove(&ptrs[index + 1],
             &ptrs[index],
-            (page->header.node.num_entries - index) * sizeof(AvaTreeCellPtr));
+            (le16toh(page->header.node.num_entries) - index) * sizeof(AvaTreeCellPtr));
 
-    ptrs[index].offset = new_cell_offset;
-    ptrs[index].size = cell_content_size;
+    ptrs[index].offset = htole16(new_cell_offset);
+    ptrs[index].size = htole16(cell_content_size);
     new_cell->key_size = key_size;
-    new_cell->value_size = value_size;
+    new_cell->value_size = htole32(value_size);
     new_cell->value_type = value_type;
     memcpy(new_cell->payload, key, key_size);
     memcpy(new_cell->payload + key_size, value, value_size);
-    page->header.node.num_entries++;
+    page->header.node.num_entries = htole16(le16toh(page->header.node.num_entries) + 1);
 }
 
 static void internal_node_insert(AvaPager* pager, AvaTreePageHeader* page, uint16_t index, ava_pgid_t left_child, char* key, uint8_t key_size) {
@@ -170,24 +173,25 @@ static void internal_node_insert(AvaPager* pager, AvaTreePageHeader* page, uint1
     if (get_node_free_space(page) < cell_content_size + sizeof(AvaTreeCellPtr)) {
         return; /* Prevent corruption */
     }
-    page->header.node.free_end -= cell_content_size;
-    ava_off_t new_cell_offset = page->header.node.free_end;
+    uint16_t current_free_end = le16toh(page->header.node.free_end);
+    page->header.node.free_end = htole16(current_free_end - cell_content_size);
+    ava_off_t new_cell_offset = le16toh(page->header.node.free_end);
 
     AvaTreeCellPtr* ptrs = get_cell_ptrs(page);
     AvaTreeInternalCell* new_cell = (AvaTreeInternalCell*)((uint8_t*)page + new_cell_offset);
 
     memmove(&ptrs[index + 1],
             &ptrs[index],
-            (page->header.node.num_entries - index) * sizeof(AvaTreeCellPtr));
+            (le16toh(page->header.node.num_entries) - index) * sizeof(AvaTreeCellPtr));
 
-    ptrs[index].offset = new_cell_offset;
-    ptrs[index].size = cell_content_size;
+    ptrs[index].offset = htole16(new_cell_offset);
+    ptrs[index].size = htole16(cell_content_size);
 
-    new_cell->left_child = left_child;
+    new_cell->left_child = htole64(left_child);
     new_cell->key_size = key_size;
     memcpy(new_cell->key, key, key_size);
 
-    page->header.node.num_entries++;
+    page->header.node.num_entries = htole16(le16toh(page->header.node.num_entries) + 1);
 }
 
 static void internal_node_update_key(AvaPager* pager, AvaTreePageHeader* page, uint16_t index, char* new_key, uint8_t new_key_size) {
@@ -197,7 +201,7 @@ static void internal_node_update_key(AvaPager* pager, AvaTreePageHeader* page, u
     if (get_node_free_space(page) < cell_content_size) {
         /* 1. Save the critical data from the old cell (left_child) */
         AvaTreeInternalCell* old_cell = get_cell_content(page, index);
-        ava_pgid_t saved_left_child = old_cell->left_child;
+        ava_pgid_t saved_left_child = le64toh(old_cell->left_child);
 
         /* 2. Mark the old cell as empty so compact_page() discards its data */
         AvaTreeCellPtr* ptrs = get_cell_ptrs(page);
@@ -211,34 +215,36 @@ static void internal_node_update_key(AvaPager* pager, AvaTreePageHeader* page, u
         }
 
         /* 4. Allocate and write the new cell */
-        page->header.node.free_end -= cell_content_size;
-        AvaTreeInternalCell* new_cell = (AvaTreeInternalCell*)((uint8_t*)page + page->header.node.free_end);
+        uint16_t current_free_end = le16toh(page->header.node.free_end);
+        page->header.node.free_end = htole16(current_free_end - cell_content_size);
+        AvaTreeInternalCell* new_cell = (AvaTreeInternalCell*)((uint8_t*)page + le16toh(page->header.node.free_end));
         
-        new_cell->left_child = saved_left_child;
+        new_cell->left_child = htole64(saved_left_child);
         new_cell->key_size = new_key_size;
         memcpy(new_cell->key, new_key, new_key_size);
 
         /* 5. Update the directory pointer */
-        ptrs[index].offset = page->header.node.free_end;
-        ptrs[index].size = cell_content_size;
+        ptrs[index].offset = page->header.node.free_end; // already LE
+        ptrs[index].size = htole16(cell_content_size);
         return;
     }
 
     /* Fast path: We have enough space to just append the new key without compacting immediately */
     AvaTreeInternalCell* old_cell = get_cell_content(page, index);
-    ava_pgid_t left_child = old_cell->left_child;
+    ava_pgid_t left_child = le64toh(old_cell->left_child);
 
-    page->header.node.free_end -= cell_content_size;
-    ava_off_t new_cell_offset = page->header.node.free_end;
+    uint16_t current_free_end = le16toh(page->header.node.free_end);
+    page->header.node.free_end = htole16(current_free_end - cell_content_size);
+    ava_off_t new_cell_offset = le16toh(page->header.node.free_end);
 
     AvaTreeInternalCell* new_cell = (AvaTreeInternalCell*)((uint8_t*)page + new_cell_offset);
-    new_cell->left_child = left_child;
+    new_cell->left_child = htole64(left_child);
     new_cell->key_size = new_key_size;
     memcpy(new_cell->key, new_key, new_key_size);
 
     AvaTreeCellPtr* ptrs = get_cell_ptrs(page);
-    ptrs[index].offset = new_cell_offset;
-    ptrs[index].size = cell_content_size;
+    ptrs[index].offset = htole16(new_cell_offset);
+    ptrs[index].size = htole16(cell_content_size);
 }
 
 /* Used to pass split data up the recursion stack */
@@ -258,23 +264,23 @@ static void leaf_node_split(AvaPager* pager, AvaTreePageHeader* old_page, char* 
 
     new_page->type = AVA_PAGE_TYPE_LEAF;
     new_page->header.node.num_entries = 0;
-    new_page->header.node.free_end = pager->page_size;
+    new_page->header.node.free_end = htole16(pager->page_size);
     new_page->header.node.right_sibling = old_page->header.node.right_sibling;
-    old_page->header.node.right_sibling = result->new_page_id;
+    old_page->header.node.right_sibling = htole64(result->new_page_id);
 
     /* Get how we'll split the entries */
-    uint16_t total_entries = old_page->header.node.num_entries;
+    uint16_t total_entries = le16toh(old_page->header.node.num_entries);
     uint16_t split_index = total_entries / 2;
 
     /* Move the first half to a new page */
     for (uint16_t i = split_index; i < total_entries; i++) {
         AvaTreeLeafCell* cell = get_cell_content(old_page, i);
-        leaf_node_insert(pager, new_page, new_page->header.node.num_entries,
+        leaf_node_insert(pager, new_page, le16toh(new_page->header.node.num_entries),
                          (char*)cell->payload, cell->key_size,
-                         (char*)(cell->payload + cell->key_size), cell->value_size, cell->value_type);
+                         (char*)(cell->payload + cell->key_size), le32toh(cell->value_size), cell->value_type);
     }
     /* Truncate from the old page */
-    old_page->header.node.num_entries = split_index;
+    old_page->header.node.num_entries = htole16(split_index);
     /* Compare new_key with the first key of the new page (the separator) */
     AvaTreeLeafCell* first_new = get_cell_content(new_page, 0);
     /* Comparison logic */
@@ -312,7 +318,7 @@ static void internal_node_split(AvaPager* pager, AvaTreePageHeader* old_page, av
      * This is the reconstruction approach. We create a temporary logical list of all
      * keys and pointers (N+1 keys, N+2 pointers) to make redistribution trivial.
      */
-    uint16_t total_items = old_page->header.node.num_entries + 1;
+    uint16_t total_items = le16toh(old_page->header.node.num_entries) + 1;
     
     /* A temporary structure to hold the logical key/pointer pairs */
     struct TmpInternalEntry {
@@ -350,10 +356,10 @@ static void internal_node_split(AvaPager* pager, AvaTreePageHeader* old_page, av
             all_children[i] = extra_child;
         } else {
             /* Copy a pointer from the old page */
-            if (old_idx < old_page->header.node.num_entries) {
-                all_children[i] = ((AvaTreeInternalCell*)get_cell_content(old_page, old_idx))->left_child;
+            if (old_idx < le16toh(old_page->header.node.num_entries)) {
+                all_children[i] = le64toh(((AvaTreeInternalCell*)get_cell_content(old_page, old_idx))->left_child);
             } else {
-                all_children[i] = old_page->header.node.right_sibling;
+                all_children[i] = le64toh(old_page->header.node.right_sibling);
             }
             old_idx++;
         }
@@ -371,22 +377,22 @@ static void internal_node_split(AvaPager* pager, AvaTreePageHeader* old_page, av
 
     /* Clear old page and initialize new page */
     old_page->header.node.num_entries = 0;
-    old_page->header.node.free_end = pager->page_size;
+    old_page->header.node.free_end = htole16(pager->page_size);
     new_page->type = AVA_PAGE_TYPE_INTERNAL;
     new_page->header.node.num_entries = 0;
-    new_page->header.node.free_end = pager->page_size;
+    new_page->header.node.free_end = htole16(pager->page_size);
 
     /* Rebuild left (old) page */
     for (int i = 0; i < median_idx; i++) {
         internal_node_insert(pager, old_page, i, all_children[i], all_entries[i].key, all_entries[i].key_size);
     }
-    old_page->header.node.right_sibling = all_children[median_idx];
+    old_page->header.node.right_sibling = htole64(all_children[median_idx]);
 
     /* Rebuild right (new) page */
     for (int i = median_idx + 1; i < total_items; i++) {
-        internal_node_insert(pager, new_page, new_page->header.node.num_entries, all_children[i], all_entries[i].key, all_entries[i].key_size);
+        internal_node_insert(pager, new_page, le16toh(new_page->header.node.num_entries), all_children[i], all_entries[i].key, all_entries[i].key_size);
     }
-    new_page->header.node.right_sibling = all_children[total_items];
+    new_page->header.node.right_sibling = htole64(all_children[total_items]);
 
     ava_pager_unpin(pager, result->new_page_id);
     free(all_entries);
@@ -408,7 +414,7 @@ static void ava_tree_insert_recursive(AvaPager* pager, ava_pgid_t page_id, char*
             /* If this is an overflow entry, free the overflow chain before attempting to delete the entry */
             AvaTreeLeafCell* cell = get_cell_content(page, insert_index);
             if (cell->value_type & AVA_VALUE_FLAG_OVERFLOW) {
-                ava_pgid_t overflow = *(ava_pgid_t*)(cell->payload + cell->key_size);
+                ava_pgid_t overflow = le64toh(*(ava_pgid_t*)(cell->payload + cell->key_size));
                 free_overflow_chain(pager, overflow);
             }
 
@@ -432,10 +438,10 @@ static void ava_tree_insert_recursive(AvaPager* pager, ava_pgid_t page_id, char*
     int found = node_find_key(page, key, key_size, &index);
     if (found) index++;
     ava_pgid_t next_pgid;
-    if (index >= page->header.node.num_entries) {
-        next_pgid = page->header.node.right_sibling;
+    if (index >= le16toh(page->header.node.num_entries)) {
+        next_pgid = le64toh(page->header.node.right_sibling);
     } else {
-        next_pgid = ((AvaTreeInternalCell*)get_cell_content(page, index))->left_child;
+        next_pgid = le64toh(((AvaTreeInternalCell*)get_cell_content(page, index))->left_child);
     }
     ava_tree_insert_recursive(pager, next_pgid, key, key_size, value, value_size, value_type, result);
     if (result->did_split) {
@@ -458,11 +464,11 @@ static void ava_tree_insert_recursive(AvaPager* pager, ava_pgid_t page_id, char*
             /* The cell that was originally at `index` is now at `index + 1`.
                Its `left_child` pointer needs to be updated to point to the new right sibling page. 
                If we inserted at the end, the right sibling pointer is the page's right_sibling. */
-            if (index == page->header.node.num_entries - 1) {
-                page->header.node.right_sibling = result->new_page_id;
+            if (index == le16toh(page->header.node.num_entries) - 1) {
+                page->header.node.right_sibling = htole64(result->new_page_id);
             } else {
                 AvaTreeInternalCell* shifted_cell = get_cell_content(page, index + 1);
-                shifted_cell->left_child = result->new_page_id;
+                shifted_cell->left_child = htole64(result->new_page_id);
             }
 
             result->did_split = 0; /* Split handled, stop bubbling up */
@@ -484,13 +490,14 @@ static void ava_tree_insert_recursive(AvaPager* pager, ava_pgid_t page_id, char*
  */
 static int is_node_underflow(AvaPager* pager, AvaTreePageHeader* page) {
     /* Calculate the static overhead */
+    uint16_t num_entries = le16toh(page->header.node.num_entries);
     uint32_t used_space = sizeof(AvaTreePageHeader) +
-                          (page->header.node.num_entries * sizeof(AvaTreeCellPtr));
+                          (num_entries * sizeof(AvaTreeCellPtr));
 
     /* Iterate through active pointers to get the actual size of live content */
     AvaTreeCellPtr* ptrs = get_cell_ptrs(page);
-    for (uint16_t i = 0; i < page->header.node.num_entries; i++) {
-        used_space += ptrs[i].size;
+    for (uint16_t i = 0; i < num_entries; i++) {
+        used_space += le16toh(ptrs[i].size);
     }
 
     /* Threshold is typically 50% of the page size */
@@ -502,29 +509,29 @@ static void leaf_node_delete(AvaTreePageHeader* page, uint16_t index) {
 
     /* We don't need to reclaim space immediately (lazy deletion).
        Just shift the pointers left. */
-    int num_to_move = page->header.node.num_entries - index - 1;
+    int num_to_move = le16toh(page->header.node.num_entries) - index - 1;
     if (num_to_move > 0) {
         memmove(&ptrs[index], &ptrs[index + 1], num_to_move * sizeof(AvaTreeCellPtr));
     }
-    page->header.node.num_entries--;
+    page->header.node.num_entries = htole16(le16toh(page->header.node.num_entries) - 1);
 }
 
 static ava_pgid_t get_child_pgid(AvaTreePageHeader* parent, uint16_t child_index) {
-    if (child_index >= parent->header.node.num_entries) {
-        return parent->header.node.right_sibling;
+    if (child_index >= le16toh(parent->header.node.num_entries)) {
+        return le64toh(parent->header.node.right_sibling);
     }
-    return ((AvaTreeInternalCell*)get_cell_content(parent, child_index))->left_child;
+    return le64toh(((AvaTreeInternalCell*)get_cell_content(parent, child_index))->left_child);
 }
 
 static void internal_node_delete_key(AvaTreePageHeader* page, uint16_t key_index) {
     /* This is a simplified delete that only removes the key/pointer from the cell array.
        It doesn't handle freeing the child page, which is done by the caller. */
     AvaTreeCellPtr* ptrs = get_cell_ptrs(page);
-    int num_to_move = page->header.node.num_entries - key_index - 1;
+    int num_to_move = le16toh(page->header.node.num_entries) - key_index - 1;
     if (num_to_move > 0) {
         memmove(&ptrs[key_index], &ptrs[key_index + 1], num_to_move * sizeof(AvaTreeCellPtr));
     }
-    page->header.node.num_entries--;
+    page->header.node.num_entries = htole16(le16toh(page->header.node.num_entries) - 1);
 }
 
 /* --- Leaf Rebalancing --- */
@@ -535,7 +542,7 @@ static void borrow_from_right_leaf(AvaPager* pager, ava_pgid_t parent_id, AvaTre
     ava_pager_mark_dirty(pager, parent_id);
 
     AvaTreeLeafCell* cell_to_move = get_cell_content(right_sibling_page, 0);
-    leaf_node_insert(pager, child_page, child_page->header.node.num_entries, (char*)cell_to_move->payload, cell_to_move->key_size, (char*)(cell_to_move->payload + cell_to_move->key_size), cell_to_move->value_size, cell_to_move->value_type);
+    leaf_node_insert(pager, child_page, le16toh(child_page->header.node.num_entries), (char*)cell_to_move->payload, cell_to_move->key_size, (char*)(cell_to_move->payload + cell_to_move->key_size), le32toh(cell_to_move->value_size), cell_to_move->value_type);
     leaf_node_delete(right_sibling_page, 0);
 
     AvaTreeLeafCell* new_separator_source = get_cell_content(right_sibling_page, 0);
@@ -547,9 +554,9 @@ static void borrow_from_left_leaf(AvaPager* pager, ava_pgid_t parent_id, AvaTree
     ava_pager_mark_dirty(pager, left_sibling_pgid);
     ava_pager_mark_dirty(pager, parent_id);
 
-    uint16_t last_idx = left_sibling_page->header.node.num_entries - 1;
+    uint16_t last_idx = le16toh(left_sibling_page->header.node.num_entries) - 1;
     AvaTreeLeafCell* cell_to_move = get_cell_content(left_sibling_page, last_idx);
-    leaf_node_insert(pager, child_page, 0, (char*)cell_to_move->payload, cell_to_move->key_size, (char*)(cell_to_move->payload + cell_to_move->key_size), cell_to_move->value_size, cell_to_move->value_type);
+    leaf_node_insert(pager, child_page, 0, (char*)cell_to_move->payload, cell_to_move->key_size, (char*)(cell_to_move->payload + cell_to_move->key_size), le32toh(cell_to_move->value_size), cell_to_move->value_type);
     leaf_node_delete(left_sibling_page, last_idx);
 
     AvaTreeLeafCell* new_sep = get_cell_content(child_page, 0);
@@ -561,19 +568,19 @@ static void merge_with_right_leaf(AvaPager* pager, ava_pgid_t parent_id, AvaTree
     ava_pager_mark_dirty(pager, right_sibling_pgid);
     ava_pager_mark_dirty(pager, parent_id);
 
-    for (uint16_t i = 0; i < right_sibling_page->header.node.num_entries; i++) {
+    for (uint16_t i = 0; i < le16toh(right_sibling_page->header.node.num_entries); i++) {
         AvaTreeLeafCell* cell_to_move = get_cell_content(right_sibling_page, i);
-        leaf_node_insert(pager, child_page, child_page->header.node.num_entries, (char*)cell_to_move->payload, cell_to_move->key_size, (char*)(cell_to_move->payload + cell_to_move->key_size), cell_to_move->value_size, cell_to_move->value_type);
+        leaf_node_insert(pager, child_page, le16toh(child_page->header.node.num_entries), (char*)cell_to_move->payload, cell_to_move->key_size, (char*)(cell_to_move->payload + cell_to_move->key_size), le32toh(cell_to_move->value_size), cell_to_move->value_type);
     }
 
     child_page->header.node.right_sibling = right_sibling_page->header.node.right_sibling;
     ava_pager_free(pager, right_sibling_pgid);
 
-    if (child_index + 1 < parent_page->header.node.num_entries) {
+    if (child_index + 1 < le16toh(parent_page->header.node.num_entries)) {
          AvaTreeInternalCell* next_cell = get_cell_content(parent_page, child_index + 1);
-         next_cell->left_child = child_pgid;
+         next_cell->left_child = htole64(child_pgid);
     } else {
-         parent_page->header.node.right_sibling = child_pgid;
+         parent_page->header.node.right_sibling = htole64(child_pgid);
     }
     internal_node_delete_key(parent_page, child_index);
 }
@@ -583,19 +590,19 @@ static void merge_with_left_leaf(AvaPager* pager, ava_pgid_t parent_id, AvaTreeP
     ava_pager_mark_dirty(pager, left_sibling_pgid);
     ava_pager_mark_dirty(pager, parent_id);
 
-    for (uint16_t i = 0; i < child_page->header.node.num_entries; i++) {
+    for (uint16_t i = 0; i < le16toh(child_page->header.node.num_entries); i++) {
         AvaTreeLeafCell* cell = get_cell_content(child_page, i);
-        leaf_node_insert(pager, left_sibling_page, left_sibling_page->header.node.num_entries, (char*)cell->payload, cell->key_size, (char*)(cell->payload + cell->key_size), cell->value_size, cell->value_type);
+        leaf_node_insert(pager, left_sibling_page, le16toh(left_sibling_page->header.node.num_entries), (char*)cell->payload, cell->key_size, (char*)(cell->payload + cell->key_size), le32toh(cell->value_size), cell->value_type);
     }
 
     left_sibling_page->header.node.right_sibling = child_page->header.node.right_sibling;
     ava_pager_free(pager, child_pgid);
 
-    if (child_index < parent_page->header.node.num_entries) {
+    if (child_index < le16toh(parent_page->header.node.num_entries)) {
         AvaTreeInternalCell* cell_at_child = get_cell_content(parent_page, child_index);
-        cell_at_child->left_child = left_sibling_pgid;
+        cell_at_child->left_child = htole64(left_sibling_pgid);
     } else {
-        parent_page->header.node.right_sibling = left_sibling_pgid;
+        parent_page->header.node.right_sibling = htole64(left_sibling_pgid);
     }
     internal_node_delete_key(parent_page, child_index - 1);
 }
@@ -608,7 +615,7 @@ static void borrow_from_right_internal(AvaPager* pager, ava_pgid_t parent_id, Av
     ava_pager_mark_dirty(pager, parent_id);
 
     AvaTreeInternalCell* parent_sep = get_cell_content(parent_page, child_index);
-    internal_node_insert(pager, child_page, child_page->header.node.num_entries, child_page->header.node.right_sibling, (char*)parent_sep->key, parent_sep->key_size);
+    internal_node_insert(pager, child_page, le16toh(child_page->header.node.num_entries), le64toh(child_page->header.node.right_sibling), (char*)parent_sep->key, parent_sep->key_size);
     
     AvaTreeInternalCell* right_0 = get_cell_content(right_sibling_page, 0);
     internal_node_update_key(pager, parent_page, child_index, (char*)right_0->key, right_0->key_size);
@@ -622,11 +629,11 @@ static void borrow_from_left_internal(AvaPager* pager, ava_pgid_t parent_id, Ava
     ava_pager_mark_dirty(pager, left_sibling_pgid);
     ava_pager_mark_dirty(pager, parent_id);
 
-    uint16_t last_idx = left_sibling_page->header.node.num_entries - 1;
+    uint16_t last_idx = le16toh(left_sibling_page->header.node.num_entries) - 1;
     AvaTreeInternalCell* left_last = get_cell_content(left_sibling_page, last_idx);
     AvaTreeInternalCell* parent_sep = get_cell_content(parent_page, child_index - 1);
 
-    ava_pgid_t old_left_right = left_sibling_page->header.node.right_sibling;
+    ava_pgid_t old_left_right = le64toh(left_sibling_page->header.node.right_sibling);
     internal_node_insert(pager, child_page, 0, old_left_right, (char*)parent_sep->key, parent_sep->key_size);
 
     internal_node_update_key(pager, parent_page, child_index - 1, (char*)left_last->key, left_last->key_size);
@@ -640,20 +647,20 @@ static void merge_with_right_internal(AvaPager* pager, ava_pgid_t parent_id, Ava
     ava_pager_mark_dirty(pager, parent_id);
 
     AvaTreeInternalCell* parent_sep = get_cell_content(parent_page, child_index);
-    internal_node_insert(pager, child_page, child_page->header.node.num_entries, child_page->header.node.right_sibling, (char*)parent_sep->key, parent_sep->key_size);
+    internal_node_insert(pager, child_page, le16toh(child_page->header.node.num_entries), le64toh(child_page->header.node.right_sibling), (char*)parent_sep->key, parent_sep->key_size);
 
-    for(uint16_t i=0; i<right_sibling_page->header.node.num_entries; i++) {
+    for(uint16_t i=0; i<le16toh(right_sibling_page->header.node.num_entries); i++) {
          AvaTreeInternalCell* cell = get_cell_content(right_sibling_page, i);
-         internal_node_insert(pager, child_page, child_page->header.node.num_entries, cell->left_child, (char*)cell->key, cell->key_size);
+         internal_node_insert(pager, child_page, le16toh(child_page->header.node.num_entries), le64toh(cell->left_child), (char*)cell->key, cell->key_size);
     }
     child_page->header.node.right_sibling = right_sibling_page->header.node.right_sibling;
     ava_pager_free(pager, right_sibling_pgid);
 
-    if (child_index + 1 < parent_page->header.node.num_entries) {
+    if (child_index + 1 < le16toh(parent_page->header.node.num_entries)) {
          AvaTreeInternalCell* next_cell = get_cell_content(parent_page, child_index + 1);
-         next_cell->left_child = child_pgid;
+         next_cell->left_child = htole64(child_pgid);
     } else {
-         parent_page->header.node.right_sibling = child_pgid;
+         parent_page->header.node.right_sibling = htole64(child_pgid);
     }
     internal_node_delete_key(parent_page, child_index);
 }
@@ -664,20 +671,20 @@ static void merge_with_left_internal(AvaPager* pager, ava_pgid_t parent_id, AvaT
     ava_pager_mark_dirty(pager, parent_id);
 
     AvaTreeInternalCell* parent_sep = get_cell_content(parent_page, child_index - 1);
-    internal_node_insert(pager, left_sibling_page, left_sibling_page->header.node.num_entries, left_sibling_page->header.node.right_sibling, (char*)parent_sep->key, parent_sep->key_size);
+    internal_node_insert(pager, left_sibling_page, le16toh(left_sibling_page->header.node.num_entries), le64toh(left_sibling_page->header.node.right_sibling), (char*)parent_sep->key, parent_sep->key_size);
 
-    for(uint16_t i=0; i<child_page->header.node.num_entries; i++) {
+    for(uint16_t i=0; i<le16toh(child_page->header.node.num_entries); i++) {
          AvaTreeInternalCell* cell = get_cell_content(child_page, i);
-         internal_node_insert(pager, left_sibling_page, left_sibling_page->header.node.num_entries, cell->left_child, (char*)cell->key, cell->key_size);
+         internal_node_insert(pager, left_sibling_page, le16toh(left_sibling_page->header.node.num_entries), le64toh(cell->left_child), (char*)cell->key, cell->key_size);
     }
     left_sibling_page->header.node.right_sibling = child_page->header.node.right_sibling;
     ava_pager_free(pager, child_pgid);
     
-    if (child_index < parent_page->header.node.num_entries) {
+    if (child_index < le16toh(parent_page->header.node.num_entries)) {
         AvaTreeInternalCell* cell_at_child = get_cell_content(parent_page, child_index);
-        cell_at_child->left_child = left_sibling_pgid;
+        cell_at_child->left_child = htole64(left_sibling_pgid);
     } else {
-        parent_page->header.node.right_sibling = left_sibling_pgid;
+        parent_page->header.node.right_sibling = htole64(left_sibling_pgid);
     }
     internal_node_delete_key(parent_page, child_index - 1);
 }
@@ -688,7 +695,7 @@ static int handle_node_underflow(AvaPager* pager, AvaTreePageHeader* parent_page
     
     ava_pgid_t right_sibling_pgid = 0;
     AvaTreePageHeader* right_sibling_page = NULL;
-    if (child_index < parent_page->header.node.num_entries) {
+    if (child_index < le16toh(parent_page->header.node.num_entries)) {
         right_sibling_pgid = get_child_pgid(parent_page, child_index + 1);
         right_sibling_page = ava_pager_get(pager, right_sibling_pgid);
     }
@@ -701,7 +708,7 @@ static int handle_node_underflow(AvaPager* pager, AvaTreePageHeader* parent_page
     }
 
     /* Attempt to borrow from right sibling */
-    if (right_sibling_page && !is_node_underflow(pager, right_sibling_page) && right_sibling_page->header.node.num_entries > 1) {
+    if (right_sibling_page && !is_node_underflow(pager, right_sibling_page) && le16toh(right_sibling_page->header.node.num_entries) > 1) {
         if (child_page->type == AVA_PAGE_TYPE_LEAF) borrow_from_right_leaf(pager, parent_id, parent_page, child_index, child_pgid, child_page, right_sibling_pgid, right_sibling_page);
         else borrow_from_right_internal(pager, parent_id, parent_page, child_index, child_pgid, child_page, right_sibling_pgid, right_sibling_page);
         ava_pager_unpin(pager, child_pgid);
@@ -711,7 +718,7 @@ static int handle_node_underflow(AvaPager* pager, AvaTreePageHeader* parent_page
     }
 
     /* Attempt to borrow from left sibling */
-    if (left_sibling_page && !is_node_underflow(pager, left_sibling_page) && left_sibling_page->header.node.num_entries > 1) {
+    if (left_sibling_page && !is_node_underflow(pager, left_sibling_page) && le16toh(left_sibling_page->header.node.num_entries) > 1) {
         if (child_page->type == AVA_PAGE_TYPE_LEAF) borrow_from_left_leaf(pager, parent_id, parent_page, child_index, child_pgid, child_page, left_sibling_pgid, left_sibling_page);
         else borrow_from_left_internal(pager, parent_id, parent_page, child_index, child_pgid, child_page, left_sibling_pgid, left_sibling_page);
         ava_pager_unpin(pager, child_pgid);
@@ -753,7 +760,7 @@ static int ava_tree_delete_recursive(AvaPager* pager, ava_pgid_t page_id, char* 
             /* If this is an overflow entry, free the overflow chain before attempting to delete the entry */
             AvaTreeLeafCell* cell = get_cell_content(page, index);
             if (cell->value_type & AVA_VALUE_FLAG_OVERFLOW) {
-                ava_pgid_t overflow = *(ava_pgid_t*)(cell->payload + cell->key_size);
+                ava_pgid_t overflow = le64toh(*(ava_pgid_t*)(cell->payload + cell->key_size));
                 free_overflow_chain(pager, overflow);
             }
 
@@ -776,10 +783,10 @@ static int ava_tree_delete_recursive(AvaPager* pager, ava_pgid_t page_id, char* 
     if (found) index++;
 
     ava_pgid_t next_pgid;
-    if (index >= page->header.node.num_entries) {
-        next_pgid = page->header.node.right_sibling;
+    if (index >= le16toh(page->header.node.num_entries)) {
+        next_pgid = le64toh(page->header.node.right_sibling);
     } else {
-        next_pgid = ((AvaTreeInternalCell*)get_cell_content(page, index))->left_child;
+        next_pgid = le64toh(((AvaTreeInternalCell*)get_cell_content(page, index))->left_child);
     }
 
     int result = ava_tree_delete_recursive(pager, next_pgid, key, key_size);
@@ -822,11 +829,11 @@ AvaTreeLeafCell* ava_tree_search(AvaPager* pager, ava_pgid_t root_pgid, char* ke
          * If none match our condition, we use the right sibling pointer on the node.
          */
         ava_pgid_t next_pgid;
-        if (index >= page->header.node.num_entries) {
-            next_pgid = page->header.node.right_sibling;
+        if (index >= le16toh(page->header.node.num_entries)) {
+            next_pgid = le64toh(page->header.node.right_sibling);
         } else {
             AvaTreeInternalCell* cell = get_cell_content(page, index);
-            next_pgid = cell->left_child;
+            next_pgid = le64toh(cell->left_child);
         }
         /* Retrieve the next page */
         ava_pager_unpin(pager, current_pgid);
@@ -865,7 +872,7 @@ ava_pgid_t ava_tree_insert(AvaPager* pager, ava_pgid_t root, char* key, uint8_t 
         /* Initialize the new leaf page */
         root_page->type = AVA_PAGE_TYPE_LEAF;
         root_page->header.node.num_entries = 0;
-        root_page->header.node.free_end = pager->page_size;
+        root_page->header.node.free_end = htole16(pager->page_size);
         root_page->header.node.right_sibling = 0; /* No siblings yet */
 
         /* Insert the first element into this new page. The index is always 0. */
@@ -886,10 +893,10 @@ ava_pgid_t ava_tree_insert(AvaPager* pager, ava_pgid_t root, char* key, uint8_t 
 
             new_root->type = AVA_PAGE_TYPE_INTERNAL;
             new_root->header.node.num_entries = 0;
-            new_root->header.node.free_end = pager->page_size;
+            new_root->header.node.free_end = htole16(pager->page_size);
 
             /* The new root has two children: the old root and the new page from the split */
-            new_root->header.node.right_sibling = result.new_page_id;
+            new_root->header.node.right_sibling = htole64(result.new_page_id);
             internal_node_insert(pager, new_root, 0, root, (char*)result.promoted_key, result.promoted_key_size);
             ava_pager_unpin(pager, root);
             ava_pager_unpin(pager, new_root_id);
@@ -907,8 +914,8 @@ ava_pgid_t ava_tree_delete(AvaPager* pager, ava_pgid_t root, char* key, uint8_t 
 
     /* Handle Root Collapse: If internal root has 0 entries (only 1 child pointer), promote the child */
     AvaTreePageHeader* root_page = ava_pager_get(pager, root);
-    if (root_page->type == AVA_PAGE_TYPE_INTERNAL && root_page->header.node.num_entries == 0) {
-        ava_pgid_t new_root = root_page->header.node.right_sibling;
+    if (root_page->type == AVA_PAGE_TYPE_INTERNAL && le16toh(root_page->header.node.num_entries) == 0) {
+        ava_pgid_t new_root = le64toh(root_page->header.node.right_sibling);
         ava_pager_unpin(pager, root);
         return new_root;
     }

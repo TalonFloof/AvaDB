@@ -1,8 +1,8 @@
 #include <stdlib.h>
 #include <avadb/avapager.h>
-
-#include "avadb/avadb.h"
-#include "avadb/avatree.h"
+#include <avadb/avadb.h>
+#include <avadb/avatree.h>
+#include <avadb/endian.h>
 
 /* --- LRU List Helpers --- */
 static void lru_remove(AvaPager* pager, AvaPagerSlot* slot) {
@@ -152,7 +152,7 @@ void ava_pager_mark_dirty(AvaPager* pager, ava_pgid_t pgid) {
 bool ava_pager_allocate(AvaPager* pager, ava_pgid_t* new_pgid) {
     AvaDBFileHeader* header = ava_pager_get(pager,0);
     if (header->free_page_start != 0) {
-        ava_pgid_t index = header->free_page_start;
+        ava_pgid_t index = le64toh(header->free_page_start);
         AvaTreePageHeader* page = ava_pager_get(pager, index);
         if (page->type != AVA_PAGE_TYPE_FREE) {
             ava_pager_unpin(pager, index);
@@ -162,6 +162,7 @@ bool ava_pager_allocate(AvaPager* pager, ava_pgid_t* new_pgid) {
         ava_pager_mark_dirty(pager,index);
         ava_pager_mark_dirty(pager,0);
 
+        /* Already Little Endian on-disk, no conversion needed */
         header->free_page_start = page->header.free.next_free;
         page->header.free.next_free = 0;
         *new_pgid = index;
@@ -183,8 +184,8 @@ void ava_pager_free(AvaPager* pager, ava_pgid_t pgid) {
     ava_pager_mark_dirty(pager,pgid);
 
     page->type = AVA_PAGE_TYPE_FREE;
-    page->header.free.next_free = header->free_page_start;
-    header->free_page_start = pgid;
+    page->header.free.next_free = header->free_page_start; /* Already in Little Endian, no need to convert */
+    header->free_page_start = htole64(pgid);
 
     ava_pager_unpin(pager, pgid);
     ava_pager_unpin(pager, 0);
