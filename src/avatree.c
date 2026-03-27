@@ -199,22 +199,22 @@ static void internal_node_update_key(AvaPager* pager, AvaTreePageHeader* page, u
 
     /* Optimization: If the page is tight, we must reclaim the OLD key's space to fit the NEW key. */
     if (get_node_free_space(page) < cell_content_size) {
-        /* 1. Save the critical data from the old cell (left_child) */
+        /* Save the critical data from the old cell (left_child) */
         AvaTreeInternalCell* old_cell = get_cell_content(page, index);
         ava_pgid_t saved_left_child = le64toh(old_cell->left_child);
 
-        /* 2. Mark the old cell as empty so compact_page() discards its data */
+        /* Mark the old cell as empty so compact_page() discards its data */
         AvaTreeCellPtr* ptrs = get_cell_ptrs(page);
         ptrs[index].size = 0;
 
-        /* 3. Compact. This deletes the old key data, making room. */
+        /* Compact. This deletes the old key data, making room. */
         compact_page(pager, page);
         
         if (get_node_free_space(page) < cell_content_size) {
              return; /* Critical failure: Page full even after compaction */
         }
 
-        /* 4. Allocate and write the new cell */
+        /* Allocate and write the new cell */
         uint16_t current_free_end = le16toh(page->header.node.free_end);
         page->header.node.free_end = htole16(current_free_end - cell_content_size);
         AvaTreeInternalCell* new_cell = (AvaTreeInternalCell*)((uint8_t*)page + le16toh(page->header.node.free_end));
@@ -223,7 +223,7 @@ static void internal_node_update_key(AvaPager* pager, AvaTreePageHeader* page, u
         new_cell->key_size = new_key_size;
         memcpy(new_cell->key, new_key, new_key_size);
 
-        /* 5. Update the directory pointer */
+        /* Update the directory pointer */
         ptrs[index].offset = page->header.node.free_end; // already LE
         ptrs[index].size = htole16(cell_content_size);
         return;
@@ -855,7 +855,7 @@ AvaTreeLeafCell* ava_tree_search(AvaPager* pager, ava_pgid_t root_pgid, char* ke
 ava_pgid_t ava_tree_insert(AvaPager* pager, ava_pgid_t root, char* key, uint8_t key_size, char* value, uint32_t value_size, uint8_t value_type) {
     /* If the size of the value hits past threshold (25%), we push the value to an overflow chain */
     if (value_size > (pager->page_size / 4)) {
-        ava_pgid_t overflow = create_overflow_chain(pager, value, value_size);
+        ava_pgid_t overflow = htole64(create_overflow_chain(pager, value, value_size));
 
         return ava_tree_insert(pager, root, key, key_size,
             (char*)&overflow,
